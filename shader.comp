@@ -1,0 +1,470 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+
+layout (local_size_x = 2, local_size_y = 2, local_size_z = 1) in;
+
+layout(binding = 0) buffer buf
+{
+	// m, x, y, z, vx, vy, vz, kRS1, kRS2, kRS3, kRS4, kRSH, kRSV, cRS1, cRS2, cRS3, cRS4, cRSH, cRSV, theta1, theta2, theta3, theta4, thetaH, thetaV, theta1P, theta2P, theta3P, theta4P, thetaHP, thetaVP,  .... |, hsk, hsc, hsl, vsk, vsc, vsl, ...
+	float data[];
+};
+
+layout(binding = 1) uniform UniformBufferObject {
+	float tSolverCurrent;
+	float tEnd;
+	int height;
+	int width;
+	int pointDataSize;
+	int springDataSize;
+	int springDataStart;
+	int nPoints;
+} ubo;
+
+layout(binding = 2) buffer computedDataBuf {
+	// m, x, y, vx, vy, kRS, theta, .... |, hsk, hsl, ...
+	float computedData[];
+};
+
+ivec4 springs = ivec4(0);
+ivec4 nDP[4] = ivec4[4](ivec4(-1), ivec4(-1), ivec4(-1), ivec4(-1));
+int dataP;
+bool updateTheta = true;
+
+float pi = 3.1415926536;
+
+void saveState(mat2x3 state) {
+	computedData[dataP + 1] = state[0][0];
+	computedData[dataP + 2] = state[0][1];
+	computedData[dataP + 3] = state[0][2];
+	computedData[dataP + 4] = state[1][0];
+	computedData[dataP + 5] = state[1][1];
+	computedData[dataP + 6] = state[1][2];
+}
+
+mat2x3 f(float t, mat2x3 state) {
+	vec3 at = vec3(0, 0, 0);
+	vec3 thisPos = state[0];
+	float thisMass = data[dataP];
+	mat4x3 connectionDirs = mat4x3(0.0);
+	vec4 connectionLengths = vec4(0.0);
+	
+	for (int i = 0; i < 4; i++) {
+		if ((springs[i] != 0) && (data[springs[i]] != 0)) { //if spring k is 0 then spring is broken and no longer forms a connection
+			vec3 otherPos = vec3(
+				data[nDP[i].x + 1],
+				data[nDP[i].x + 2],
+				data[nDP[i].x + 3]
+			);
+
+			float springK = data[springs[i]];
+			float springC = data[springs[i] + 1];
+			float springL = data[springs[i] + 2];
+
+			vec3 dirVec = thisPos - otherPos;
+			connectionDirs[i] = dirVec;
+			float curLength = abs(distance(thisPos, otherPos));
+			connectionLengths[i] = curLength;
+			float deformation = curLength - springL;
+			vec3 dirUnitVec = normalize(dirVec);
+			vec3 v = vec3(state[1][0], state[1][1], state[1][2]) - 
+				vec3(data[nDP[i].x + 4], data[nDP[i].x + 5], data[nDP[i].x + 6]);
+			at += (dirUnitVec * (- springK) * deformation / thisMass) - ((springC * v) / thisMass);
+
+			ivec3 radSprings;
+			if (i == 0) {
+				radSprings = ivec3(
+					nDP[i].x + 9,
+					nDP[i].x + 11,
+					nDP[i].x + 8
+				);
+			}
+			else if (i == 1) {
+				radSprings = ivec3(
+					nDP[i].x + 10,
+					nDP[i].x + 12,
+					nDP[i].x + 9
+				);
+			}
+			else if (i == 2) {
+				radSprings = ivec3(
+					nDP[i].x + 7,
+					nDP[i].x + 11,
+					nDP[i].x + 10
+				);
+			}
+			else {
+				radSprings = ivec3(
+					nDP[i].x + 8,
+					nDP[i].x + 12,
+					nDP[i].x + 7
+				);
+			}
+			
+			for (int j = 1; j < 4; j++) {
+				if (nDP[i][j] >= 0) {
+					vec3 otherOtherPos = vec3(
+						data[nDP[i][j] + 1],
+						data[nDP[i][j] + 2],
+						data[nDP[i][j] + 3]
+					);
+
+					float radSpringK = data[radSprings[j - 1]];
+					float radSpringC = data[radSprings[j - 1] + 6];
+					float radSpringTheta = data[radSprings[j - 1] + 12];
+					float radSpringPrevTheta = data[radSprings[j - 1] + 18];
+
+					vec3 otherDirVec = otherOtherPos - otherPos;
+					float otherCurLength = abs(distance(otherPos, otherOtherPos));
+					float dotProd = dot(dirVec, otherDirVec) / (curLength * otherCurLength);
+					
+					//due to floating point errors, abs(dotProd) can sometimes be > 1;
+					if (dotProd >= 1) {
+						dotProd = 1; 
+					}
+					else if (dotProd <= -1) {
+						dotProd = -1;
+					}
+					float angle = acos(dotProd) * (180.0 / pi);
+					
+					float torque = - 2 * (- radSpringK) * (pi / 180.0) * (radSpringTheta - angle);
+					float dampening = radSpringC * (radSpringPrevTheta - angle);
+					torque += dampening;
+					torque /= thisMass * curLength;
+					vec3 torqueDirVec = cross(dirVec, cross(dirVec, otherDirVec));
+					if (torqueDirVec == vec3(0, 0, 0)) {
+						continue;
+					}
+					torqueDirVec = normalize(torqueDirVec);
+					if (isnan(torqueDirVec).x || isinf(torqueDirVec.x)) {
+						continue;
+					}
+					vec3 aRad = torqueDirVec * torque;
+					if (isnan(aRad.x)) {
+						saveState(mat2x3(aRad.x, torqueDirVec, 0, -90));
+					}
+					at += aRad;
+				}
+			}
+			
+		}
+	}
+
+	int connectionsAll[6] = int[6](0, 1, 2, 3, 0, 1);
+	int connectionsAllOff[6] = int[6](1, 2, 3, 0, 2, 3);
+	
+	for (int i = 0; i < 6; i++) {
+		if ((springs[connectionsAll[i]] != 0) && (springs[connectionsAllOff[i]] != 0)) {
+			float dotProd = dot(connectionDirs[connectionsAll[i]], connectionDirs[connectionsAllOff[i]]) / (connectionLengths[connectionsAll[i]] * connectionLengths[connectionsAllOff[i]]);
+			if (dotProd >= 1) {
+				dotProd = 1; 
+			}
+			else if (dotProd <= -1) {
+				dotProd = -1;
+			}
+			float angle = acos(dotProd) * (180.0 / pi);
+			if (updateTheta) {
+				computedData[dataP + 25 + i] = angle;
+			}
+			vec3 normal = cross(connectionDirs[connectionsAll[i]], connectionDirs[connectionsAllOff[i]]);
+			vec3 aDirVec = cross(connectionDirs[connectionsAll[i]], normal);
+			vec3 bDirVec = cross(connectionDirs[connectionsAllOff[i]], normal);
+			if ((aDirVec == vec3(0, 0, 0)) || (bDirVec == vec3(0, 0, 0))) {
+				continue;
+			}
+			vec3 aDirU = normalize(aDirVec);
+			vec3 bDirU = - normalize(bDirVec);
+			
+			float radSpringK = data[dataP + 7 + i];
+			float radSpringC = data[dataP + 13 + i];
+			float radSpringTheta = data[dataP + 19 + i];
+			float radSpringPrevTheta = data[dataP + 25 + i];
+
+			float torque = - 2 * (- radSpringK) * (pi / 180.0) * (radSpringTheta - angle);
+			float dampening = radSpringC * (radSpringPrevTheta - angle);
+			torque += dampening;
+			vec3 atRad = aDirU * (torque / (connectionLengths[connectionsAll[i]] * thisMass));
+			atRad += bDirU * (torque / (connectionLengths[connectionsAllOff[i]] * thisMass));
+			at += atRad;
+		}
+	}
+	
+	if (updateTheta) {
+		updateTheta = false;
+	}
+	at.z -= 9.81; //z direction is up
+	return mat2x3(state[1], at);
+}
+
+void rk4() {
+    float t = ubo.tSolverCurrent;
+    float h = (ubo.tEnd - ubo.tSolverCurrent) / 5.0;
+    float b5[6] = float[6](16.0 / 135.0, 0.0, 6656.0 / 12825.0, 28561.0 / 56430.0, -9.0 / 50.0, 2.0 / 55.0);
+    float b4[6] = float[6](25.0 / 216.0, 0.0, 1408.0 / 2565.0, 2197.0 / 4104.0, -1.0 / 5.0, 0.0);
+	mat2x3 state = mat2x3(vec3(data[dataP + 1],
+		data[dataP + 2],
+		data[dataP + 3]),
+		vec3(data[dataP + 4],
+		data[dataP + 5],
+		data[dataP + 6]));
+	int i = 0;
+    while (t < ubo.tEnd) {
+		i++;
+        if (ubo.tEnd - t < h) {
+            h = ubo.tEnd - t;
+		}
+        mat2x3 k[6] = mat2x3[6](state, state, state, state, state, state);
+        k[0] = f(t, k[0]);
+		if (isnan(k[0][0][0])) {
+			return;
+		}
+        k[1] = f(t + (1.0 / 4.0) * h, k[1] + (1.0 / 4.0) * h * k[0]);
+		if (isnan(k[1][0][0])) {
+			return;
+		}
+        k[2] = f(t + (3.0 / 8.0) * h, k[2] + h * ((3.0 / 32.0) * k[0] + (9.0 / 32.0) * k[1]));
+		if (isnan(k[2][0][0])) {
+			return;
+		}
+        k[3] = f(t + (12.0 / 13.0) * h, k[3] + h * ((1932.0 / 2197.0) * k[0] + (-7200.0 / 2197.0) * k[1] + (7296.0 / 2197.0) * k[2]));
+		if (isnan(k[3][0][0])) {
+			return;
+		}
+        k[4] = f(t + h, k[4] + h * ((439.0 / 216.0) * k[0] + (-8.0) * k[1] + (3680.0 / 513.0) * k[2] + (-845.0 / 4104.0) * k[3]));
+		if (isnan(k[4][0][0])) {
+			return;
+		}
+        k[5] = f(t + (1.0 / 2.0) * h, k[5] + h * ((-8.0 / 27.0) * k[0] + (2.0) * k[1] + (-3544.0 / 2565.0) * k[2] + (1859.0 / 4104.0) * k[3] + (-11.0 / 40.0) * k[4]));
+		if (isnan(k[5][0][0])) {
+			return;
+		}
+
+		mat2x3 y4n1 = mat2x3(0);
+		mat2x3 y5n1 = mat2x3(0);
+		for (int j = 0; j < 6; j++) {
+			y4n1 += b4[j] * k[j];
+			y5n1 += b5[j] * k[j];
+		}
+
+		y4n1 *= h;
+		y5n1 *= h;
+
+        mat2x3 error = y5n1 - y4n1;
+        
+		bool errorTooLarge = false;
+
+		for (int i = 0; i < 2; i++) {
+			for (int j = 0; j < 3; j++) {
+				if (abs(error[i][j]) > 0.00001) { //0.0000001
+				//if (abs(error[i][j]) > 0.00000000001) {
+					h /= 2.0;
+					errorTooLarge = true;
+					break;
+				}
+			}
+			if (errorTooLarge) {
+				break;
+			}
+		}
+		if (errorTooLarge) {
+			continue;
+		}
+        t += h;
+        state += y4n1;
+		if (isnan(state[0][0])) {
+			return;
+		}
+		//saveState(mat2x3(state[1], i, t, 0));
+		//break;
+        
+		bool errorTooSmall = true;
+		for (int i = 0; i < 2; i++) {
+			for (int j = 0; j < 3; j++) {
+				if (abs(error[i][j]) >= 0.0000001) { //0.000000001
+				//if (abs(error[i][j]) >= 0.0000000000001) {
+					errorTooSmall = false;
+					break;
+				}
+			}
+			if (!errorTooSmall) {
+				break;
+			}
+		}
+		if (errorTooSmall) {
+			h *= 2;
+		}
+	}
+	saveState(state);
+}
+
+void setNeighboursDataP(int p, int exclude, int i) {
+	int left = -1;
+	int middle = -1;
+	int right = -1;
+	if (exclude == 1) {
+		if (gl_GlobalInvocationID.y < ubo.height - 1) {
+			left = p - 1 + ubo.width;
+		}
+		if (gl_GlobalInvocationID.x > 1) {
+			middle = p - 2;
+		}
+		if (gl_GlobalInvocationID.y > 0) {
+			right = p - 1 - ubo.width;
+		}
+	}
+	else if (exclude == 2) {
+		if (gl_GlobalInvocationID.x > 0) {
+			left = p - 1 - ubo.width;
+		}
+		if (gl_GlobalInvocationID.y > 1) {
+			middle = p - (2 * ubo.width);
+		}
+		if (gl_GlobalInvocationID.x < ubo.width - 1) {
+			right = p + 1 - ubo.width;
+		}
+	}
+	else if (exclude == 3) {
+		if (gl_GlobalInvocationID.y > 0) {
+			left = p + 1 - ubo.width;
+		}
+		if (gl_GlobalInvocationID.x < ubo.width - 2) {
+			middle = p + 2;
+		}
+		if (gl_GlobalInvocationID.y < ubo.height - 1) {
+			right = p + 1 + ubo.width;
+		}
+	}
+	else {
+		if (gl_GlobalInvocationID.x < ubo.width - 1) {
+			left = p + 1 + ubo.width;
+		}
+		if (gl_GlobalInvocationID.y < ubo.height - 2) {
+			middle = p + (2 * ubo.height);
+		}
+		if (gl_GlobalInvocationID.x > 0) {
+			right = p - 1 + ubo.width;
+		}
+	}
+
+	nDP[i].yzw = ubo.pointDataSize * ivec3(left, middle, right);
+}
+
+void main() {
+	if ((gl_GlobalInvocationID.x >= ubo.width) || (gl_GlobalInvocationID.y >= ubo.height))  {
+		return;
+	}
+
+	int dPos = int(gl_GlobalInvocationID.x) + (ubo.width * int(gl_GlobalInvocationID.y));
+	dataP = ubo.pointDataSize * dPos;
+
+	int sDPos = (2 * int(gl_GlobalInvocationID.x)) + (((2 * ubo.width) - 1) * int(gl_GlobalInvocationID.y));
+	if (gl_GlobalInvocationID.x < ubo.width - 1) {
+		if (gl_GlobalInvocationID.y != ubo.height - 1) {
+			springs.x = ubo.springDataStart + (ubo.springDataSize * sDPos);
+		}
+		else {
+			springs.x = ubo.springDataStart + (ubo.springDataSize * (sDPos - int(gl_GlobalInvocationID.x)));
+		}
+		nDP[0].x = ubo.pointDataSize * (dPos + 1);
+		setNeighboursDataP(dPos, 3, 0);
+		//saveState(mat2x3(vec3(nDP[0].xyz), nDP[0].w, 0, 0));
+	}
+	//return;
+	if (gl_GlobalInvocationID.y < ubo.height - 1) {
+		if (gl_GlobalInvocationID.x != ubo.width - 1) {
+			springs.y = ubo.springDataStart + (ubo.springDataSize * (sDPos + 1));
+		}
+		else {
+			springs.y = ubo.springDataStart + (ubo.springDataSize * sDPos);
+		}
+		nDP[1].x = ubo.pointDataSize * (dPos + ubo.width);
+		setNeighboursDataP(dPos, 4, 1);
+	}
+
+	if (gl_GlobalInvocationID.x > 0) {
+		if (gl_GlobalInvocationID.y != ubo.height - 1) {
+			springs.z = ubo.springDataStart + (ubo.springDataSize * (sDPos - 2));
+		}
+		else {
+			springs.z = ubo.springDataStart + (ubo.springDataSize * ((sDPos - int(gl_GlobalInvocationID.x)) - 1));
+		}
+		nDP[2].x = ubo.pointDataSize * (dPos - 1);
+		setNeighboursDataP(dPos, 1, 2);
+	}
+
+	if (gl_GlobalInvocationID.y > 0) {
+		if (gl_GlobalInvocationID.x != ubo.width - 1) {
+			springs.w = ubo.springDataStart + (ubo.springDataSize * (sDPos - ((2 * ubo.width) - 1) + 1));
+		}
+		else {
+			springs.w = ubo.springDataStart + (ubo.springDataSize * (sDPos - ((2 * ubo.width) - 1)));
+		}
+		nDP[3].x = ubo.pointDataSize * (dPos - ubo.width);
+		setNeighboursDataP(dPos, 2, 3);
+	}
+	if ((gl_GlobalInvocationID.x == (ubo.width - 1) / 2) && (gl_GlobalInvocationID.y == (ubo.height - 1) / 2)) {
+		for (int i = 0; i < ubo.pointDataSize - 6; i++) {
+			computedData[dataP + i] = data[dataP + i];
+		}
+		int connectionsAll[6] = int[6](0, 1, 2, 3, 0, 1);
+		int connectionsAllOff[6] = int[6](1, 2, 3, 0, 2, 3);
+		for (int i = 0; i < 6; i++) {
+			if ((springs[connectionsAll[i]] != 0) && (springs[connectionsAllOff[i]] != 0)) {
+				vec3 leftConnectionPos = vec3(
+					data[nDP[connectionsAll[i]].x + 1],
+					data[nDP[connectionsAll[i]].x + 2],
+					data[nDP[connectionsAll[i]].x + 3]
+				);
+
+				vec3 rightConnectionPos = vec3(
+					data[nDP[connectionsAllOff[i]].x + 1],
+					data[nDP[connectionsAllOff[i]].x + 2],
+					data[nDP[connectionsAllOff[i]].x + 3]
+				);
+
+				vec3 thisPos = vec3(
+					data[dataP + 1],
+					data[dataP + 2],
+					data[dataP + 3]
+				);
+
+				vec3 leftConnectionDir = thisPos - leftConnectionPos;
+				vec3 rightConnectionDir = thisPos - rightConnectionPos;
+
+				float leftConnectionL = abs(distance(thisPos, leftConnectionPos));
+				float rightConnectionL = abs(distance(thisPos, rightConnectionPos));
+
+				float dotProd = dot(leftConnectionDir, rightConnectionDir) / (leftConnectionL * rightConnectionL);
+				if (dotProd >= 1) {
+					dotProd = 1; 
+				}
+				else if (dotProd <= -1) {
+					dotProd = -1;
+				}
+				float angle = acos(dotProd) * (180.0 / pi);
+				computedData[dataP + 19 + i] = angle;
+			}
+		}
+	}
+	else {
+		rk4();
+
+		computedData[dataP] = data[dataP];
+		for (int i = 0; i < ubo.pointDataSize - 13; i++) {
+			computedData[dataP + 7 + i] = data[dataP + 7 + i];
+		}
+	}
+	if (gl_GlobalInvocationID.x < ubo.width) {
+		int nSprings = 2;
+		int springDPos = springs.x;
+		if (gl_GlobalInvocationID.x == ubo.width - 1) {
+			springDPos = springs.y;
+			nSprings --;
+		}
+		if (gl_GlobalInvocationID.y == ubo.height - 1) {
+			nSprings --;
+		}
+		for (int i = 0; i < (nSprings * ubo.springDataSize); i++) {
+			computedData[springDPos + i] = data[springDPos + i];
+		}
+	}
+}
